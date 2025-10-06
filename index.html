@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Book of Blinking - Recursive Split</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: Georgia, 'Times New Roman', Times, serif;
+        }
+        
+        body {
+            background: #000;
+            color: white;
+            height: 100vh;
+            overflow: hidden;
+            position: relative;
+        }
+        
+        .canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+            background: #000;
+        }
+        
+        .region {
+            position: absolute;
+            overflow: hidden;
+            background-size: cover;
+            background-position: center;
+            transition: filter 0.3s ease;
+        }
+        
+        .region.blurred {
+            filter: blur(10px);
+        }
+        
+        .camera-container {
+            display: none; /* 隐藏摄像头 */
+        }
+        
+        .stats-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 10px;
+            z-index: 2;
+            backdrop-filter: blur(5px);
+            min-width: 200px;
+        }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+
+        .stat-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .stat-label {
+            font-weight: normal;
+        }
+
+        .stat-value {
+            color: #4cd964;
+        }
+
+        .blink-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ff4757;
+            display: inline-block;
+            margin-right: 8px;
+        }
+
+        .blink-active {
+            background: #2ed573;
+            animation: blink 0.5s;
+        }
+
+        @keyframes blink {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.5); }
+            100% { transform: scale(1); }
+        }
+
+        .headline{
+            font-size: larger;
+            font-weight: bold;
+        }
+        
+        .loading {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 10;
+        }
+        
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 5px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+            margin-bottom: 20px;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <!-- 递归分割容器 -->
+    <div class="canvas-container" id="regions-container"></div>
+    
+    <!-- 隐藏的摄像头预览，用于眨眼检测 -->
+    <div class="camera-container">
+        <video id="camera" autoplay playsinline></video>
+        <div class="face-canvas-container">
+            <canvas id="output_canvas"></canvas>
+        </div>
+    </div>
+    
+    <!-- 状态面板 - 只保留标题 -->
+    <div class="stats-panel">
+        <div class="stat-row">
+            <span class="headline">The Book of Blinking</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">Aspect Ratio:</span>
+            <span class="stat-value" id="ear-value">0.00</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">Page:</span>
+            <span class="stat-value" id="blink-count">0</span>
+        </div>
+        <div class="stat-row">
+            <span class="stat-label">Status:</span>
+            <span class="stat-value">
+                <span class="blink-indicator" id="blink-indicator"></span>
+                <span id="status-text">Waiting</span>
+            </span>
+        </div>
+    </div>
+    
+
+    <!-- 加载界面 -->
+    <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <p>Initializing...</p>
+    </div>
+
+    <script>
+        // 20张图片URL
+        const imageUrls = [
+            'assets/image1.jpg',
+            'assets/image2.jpg',
+            'assets/image3.jpg',
+            'assets/image4.jpg',
+            'assets/image5.jpg',
+            'assets/image6.jpg',
+            'assets/image7.jpg',
+            'assets/image8.jpg',
+            'assets/image9.jpg',
+            'assets/image10.jpg',
+            'assets/image11.jpg',
+            'assets/image12.jpg',
+            'assets/image13.jpg',
+            'assets/image14.jpg',
+            'assets/image15.jpg',
+            'assets/image16.jpg',
+            'assets/image17.jpg',
+            'assets/image18.jpg',
+          ];
+        
+        // 递归分割相关变量
+        let images = [];
+        let currentImageIndex = 0;
+        let splitCount = 0;
+        let regions = [];
+        let loadedImages = 0;
+        let isBlinking = false;
+        
+        // 固定概率控制
+        const splitProbability = 0.55; // 65%概率分割
+        const changeProbability = 0.45; // 35%概率换图
+        
+        // 面部检测相关变量
+        let faceMesh = null;
+        let camera = null;
+        let blinkCount = 0;
+        
+        // 模糊效果相关变量
+        let blurEnabled = false;
+        let blurProbability = 0;
+        let blurIntensity = 10; // 基础模糊强度
+        
+        // DOM元素
+        const regionsContainer = document.getElementById('regions-container');
+        const cameraElement = document.getElementById('camera');
+        const outputCanvas = document.getElementById('output_canvas');
+        const loadingElement = document.getElementById('loading');
+        const canvasCtx = outputCanvas.getContext('2d');
+        const earValue = document.getElementById('ear-value');
+        const blinkCountElement = document.getElementById('blink-count');
+        const blinkIndicator = document.getElementById('blink-indicator');
+        const statusText = document.getElementById('status-text');
+        
+        // 初始化函数
+        function init() {
+            // 设置容器尺寸
+            regionsContainer.style.width = window.innerWidth + 'px';
+            regionsContainer.style.height = window.innerHeight + 'px';
+            outputCanvas.width = 640;
+            outputCanvas.height = 480;
+            
+            // 预加载图片
+            preloadImages();
+        }
+        
+        // 预加载所有图片
+        function preloadImages() {
+            for (let i = 0; i < imageUrls.length; i++) {
+                images[i] = new Image();
+                images[i].src = imageUrls[i];
+                images[i].onload = function() {
+                    loadedImages++;
+                    if (loadedImages === imageUrls.length) {
+                        // 所有图片加载完成
+                        initializeRegions();
+                        drawRegions();
+                        // 开始面部检测
+                        startFaceDetection();
+                    }
+                };
+                images[i].onerror = function() {
+                    console.error('图片加载失败:', imageUrls[i]);
+                    loadedImages++;
+                    if (loadedImages === imageUrls.length) {
+                        initializeRegions();
+                        drawRegions();
+                        startFaceDetection();
+                    }
+                };
+            }
+        }
+        
+        // 初始化区域
+        function initializeRegions() {
+            regions = [{
+                x: 0,
+                y: 0,
+                width: window.innerWidth,
+                height: window.innerHeight,
+                imageIndex: Math.floor(Math.random() * images.length), // 随机选择一张图片
+                element: null
+            }];
+            splitCount = 0;
+        }
+        
+        // 更新模糊概率和强度
+        function updateBlurProbability() {
+            if (blinkCount >= 100 && blinkCount <= 140) {
+                // 从140到210，模糊概率从0%线性增长到100%
+                blurProbability = (blinkCount - 100) / 40;
+                blurEnabled = true;
+            } else if (blinkCount > 140 && blinkCount <= 180) {
+                // 从210到250，模糊强度逐渐增加
+                blurProbability = 1;
+                blurEnabled = true;
+                // 计算强度增加比例 (从10px到20px)
+                const intensityRatio = (blinkCount - 140) / 40;
+                blurIntensity = 10 + (intensityRatio * 10); // 从10px增加到20px
+            } else if (blinkCount > 180) {
+                blurProbability = 1;
+                blurEnabled = true;
+                blurIntensity = 20; // 保持最大强度
+            } else {
+                blurEnabled = false;
+                blurIntensity = 10; // 重置为基础强度
+            }
+        }
+        
+        // 应用模糊效果
+        function applyBlurEffect(region) {
+            if (!blurEnabled || !region.element) return;
+            
+            // 根据模糊概率决定是否应用模糊
+            if (Math.random() < blurProbability) {
+                region.element.classList.add('blurred');
+                // 动态设置模糊强度
+                region.element.style.filter = `blur(${blurIntensity}px)`;
+            } else {
+                region.element.classList.remove('blurred');
+                region.element.style.filter = 'none';
+            }
+        }
+        
+        // 绘制所有区域
+        function drawRegions() {
+            // 清空容器
+            regionsContainer.innerHTML = '';
+            
+            regions.forEach(region => {
+                // 创建区域元素
+                const regionElement = document.createElement('div');
+                regionElement.className = 'region';
+                regionElement.style.left = region.x + 'px';
+                regionElement.style.top = region.y + 'px';
+                regionElement.style.width = region.width + 'px';
+                regionElement.style.height = region.height + 'px';
+                regionElement.style.backgroundImage = `url(${images[region.imageIndex].src})`;
+                
+                regionsContainer.appendChild(regionElement);
+                region.element = regionElement;
+                
+                // 检查并可能应用模糊效果
+                applyBlurEffect(region);
+            });
+        }
+        
+        // 生成随机水平或垂直线
+        function generateRandomLine(region) {
+            const isHorizontal = Math.random() > 0.5;
+            let position;
+            
+            if (isHorizontal) {
+                position = region.y + Math.random() * region.height;
+            } else {
+                position = region.x + Math.random() * region.width;
+            }
+            
+            return {
+                isHorizontal: isHorizontal,
+                position: position
+            };
+        }
+        
+        // 使用线分割区域
+        function splitRegionWithLine(region, line) {
+            const newRegions = [];
+            
+            if (line.isHorizontal) {
+                const topRegion = {
+                    x: region.x,
+                    y: region.y,
+                    width: region.width,
+                    height: line.position - region.y,
+                    imageIndex: Math.random() < 0.5 ? region.imageIndex : Math.floor(Math.random() * images.length), // 50%概率使用原图片，50%概率使用随机图片
+                    element: null
+                };
+                
+                const bottomRegion = {
+                    x: region.x,
+                    y: line.position,
+                    width: region.width,
+                    height: region.y + region.height - line.position,
+                    imageIndex: Math.random() < 0.5 ? region.imageIndex : Math.floor(Math.random() * images.length), // 50%概率使用原图片，50%概率使用随机图片
+                    element: null
+                };
+                
+                newRegions.push(topRegion, bottomRegion);
+            } else {
+                const leftRegion = {
+                    x: region.x,
+                    y: region.y,
+                    width: line.position - region.x,
+                    height: region.height,
+                    imageIndex: Math.random() < 0.5 ? region.imageIndex : Math.floor(Math.random() * images.length), // 50%概率使用原图片，50%概率使用随机图片
+                    element: null
+                };
+                
+                const rightRegion = {
+                    x: line.position,
+                    y: region.y,
+                    width: region.x + region.width - line.position,
+                    height: region.height,
+                    imageIndex: Math.random() < 0.5 ? region.imageIndex : Math.floor(Math.random() * images.length), // 50%概率使用原图片，50%概率使用随机图片
+                    element: null
+                };
+                
+                newRegions.push(leftRegion, rightRegion);
+            }
+            
+            return newRegions;
+        }
+        
+        // 更换图片
+        function changeImage() {
+            currentImageIndex = Math.floor(Math.random() * images.length);
+            // 重置所有区域使用新图片
+            regions.forEach(region => {
+                region.imageIndex = currentImageIndex;
+            });
+        }
+        
+        // 执行分割操作
+        function performSplit() {
+            splitCount++;
+            
+            const randomIndex = Math.floor(Math.random() * regions.length);
+            const selectedRegion = regions[randomIndex];
+            const newLine = generateRandomLine(selectedRegion);
+            const newRegions = splitRegionWithLine(selectedRegion, newLine);
+            
+            regions.splice(randomIndex, 1, ...newRegions);
+            drawRegions();
+        }
+        
+        // 执行换图操作
+        function performChangeImage() {
+            changeImage();
+            drawRegions();
+        }
+        
+        // 处理眨眼事件
+        function handleBlinkAction() {
+            blinkCount++; // 增加眨眼计数
+            blinkCountElement.textContent = blinkCount; // 更新显示
+            
+            // 更新模糊概率和强度
+            updateBlurProbability();
+
+            // 前40页只进行图片切换，不进行分割
+            if (blinkCount <= 40) {
+                // 随机选择一张新图片
+                performChangeImage();
+                return;
+            }
+            
+            // 如果已经达到15次分割，则必然换图
+            if (splitCount >= 10) {
+                initializeRegions();
+                performChangeImage();
+                return;
+            }
+            
+            // 根据固定概率随机选择操作
+            const randomValue = Math.random();
+            if (randomValue < splitProbability) {
+                performSplit();
+            } else {
+                performChangeImage();
+            }
+            
+            // 对所有区域应用模糊效果
+            regions.forEach(region => {
+                applyBlurEffect(region);
+            });
+        }
+        
+        // 开始面部检测
+        function startFaceDetection() {
+            faceMesh = new FaceMesh({
+                locateFile: (file) => {
+                    return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+                }
+            });
+            
+            faceMesh.setOptions({
+                maxNumFaces: 1,
+                refineLandmarks: true,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+            
+            faceMesh.onResults(onFaceMeshResults);
+            
+            camera = new Camera(cameraElement, {
+                onFrame: async () => {
+                    await faceMesh.send({image: cameraElement});
+                },
+                width: 640,
+                height: 480
+            });
+            
+            camera.start().then(() => {
+                setTimeout(() => {
+                    loadingElement.style.display = 'none';
+                }, 1000);
+            });
+        }
+        
+        // 处理Face Mesh结果
+        function onFaceMeshResults(results) {
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, outputCanvas.width, outputCanvas.height);
+            canvasCtx.drawImage(results.image, 0, 0, outputCanvas.width, outputCanvas.height);
+            
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                const landmarks = results.multiFaceLandmarks[0];
+                const ear = calculateEAR(landmarks);
+                earValue.textContent = ear.toFixed(2); // 更新EAR显示
+                detectBlink(ear);
+            }
+            
+            canvasCtx.restore();
+        }
+        
+        // 计算眼睛纵横比(EAR)
+        function calculateEAR(landmarks) {
+            const leftEye = [33, 160, 158, 133, 153, 144];
+            const rightEye = [362, 385, 387, 263, 373, 380];
+            
+            const leftEAR = getEAR(landmarks, leftEye);
+            const rightEAR = getEAR(landmarks, rightEye);
+            
+            return (leftEAR + rightEAR) / 2;
+        }
+        
+        // 计算单眼EAR
+        function getEAR(landmarks, eyeIndices) {
+            const p1 = landmarks[eyeIndices[0]];
+            const p2 = landmarks[eyeIndices[1]];
+            const p3 = landmarks[eyeIndices[2]];
+            const p4 = landmarks[eyeIndices[3]];
+            const p5 = landmarks[eyeIndices[4]];
+            const p6 = landmarks[eyeIndices[5]];
+            
+            const A = distance(p2, p6);
+            const B = distance(p3, p5);
+            const C = distance(p1, p4);
+            
+            return (A + B) / (2.0 * C);
+        }
+        
+        // 计算两点间距离
+        function distance(p1, p2) {
+            return Math.sqrt(
+                Math.pow(p1.x - p2.x, 2) + 
+                Math.pow(p1.y - p2.y, 2)
+            );
+        }
+        
+        // 检测眨眼
+        function detectBlink(ear) {
+            const blinkThreshold = 0.2;
+            
+            if (ear < blinkThreshold && !isBlinking) {
+                isBlinking = true;
+                
+                // 恢复状态指示器
+                blinkIndicator.classList.add('blink-active');
+                statusText.textContent = 'Blinking';
+                
+                // 处理眨眼动作
+                handleBlinkAction();
+                
+                setTimeout(() => {
+                    isBlinking = false;
+                    blinkIndicator.classList.remove('blink-active');
+                    statusText.textContent = 'Waiting';
+                }, 500);
+            }
+        }
+
+        
+        // 页面加载完成后初始化
+        window.addEventListener('DOMContentLoaded', init);
+        
+        // 窗口大小改变时调整容器
+        window.addEventListener('resize', function() {
+            regionsContainer.style.width = window.innerWidth + 'px';
+            regionsContainer.style.height = window.innerHeight + 'px';
+            drawRegions();
+        });
+    </script>
+</body>
+</html>
